@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# ibx — InstaBox 沙箱控制台 CLI
+# 依赖：bash + curl + node（JSON 解析交给 scripts/jq.js）
+#
+# 配置：
+#   IBX_API_KEY   或 ~/.instabox/key        （X-API-Key）
+#   IBX_MACHINE   或 ~/.instabox/machine    （默认机器 ID）
+#   IBX_API       默认 https://api.instabox.sh/v1
+set -uo pipefail
+
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JQ="$SELF_DIR/jq.js"
+API="${IBX_API:-https://api.instabox.sh/v1}"
+CFG="${IBX_CFG:-$HOME/.instabox}"
+TIMEOUT="${IBX_TIMEOUT:-60}"
+IBX_CODE=000
+BODY=""
+
+_key() {
+  if [ -n "${IBX_API_KEY:-}" ]; then printf '%s' "$IBX_API_KEY"; return 0; fi
+  if [ -r "$CFG/key" ]; then tr -d '\r\n' <"$CFG/key"; return 0; fi
+  echo "ibx: 缺 API key。设置 IBX_API_KEY，或 printf %s <key> > $CFG/key" >&2
+  return 1
+}
+
+_idem() { cat /proc/sys/kernel/random/uuid 2>/dev/null || printf '%s-%s' "$RANDOM" "$(date +%s%N)"; }
+
+_jq() { printf '%s' "$BODY" | node "$JQ" "$1"; }
+
+# _req METHOD PATH [BODY] [IDEM]  → 设置全局 BODY，返回 0 表示 2xx
+_req() {
+  local method=$1 path=$2 data=${3:-} idem=${4:-} key
+  key=$(_key) || { IBX_CODE=000; return 1; }
+  local -a a=(-sS --max-time "$TIMEOUT" -X "$method"
+              -H "X-API-Key: $key" -H "Accept: application/json")
+  [ -n "$idem" ] && a+=(-H "Idempotency-Key: $idem")
+  [ -n "$data" ] && a+=(-H "Content-Type: application/json" --data-binary "$data")
+  local tmp; tmp=$(mktemp)
+  IBX_CODE=$(curl "${a[@]}" -o "$tmp" -w '%{http_code}' "$API$path")
+  BODY=$(cat "$tmp"); rm -f "$tmp"
+  [ "${IBX_CODE:0:1}" = "2" ]
+}
+
+fail() {
+  echo "ibx: HTTP $IBX_CODE" >&2
+  printf '%s' "$BODY" | node "$JQ" "field:" 2>/dev/null | head -40 >&2
+  printf '%s' "$BODY" | node "$JQ" "field:error.code" 2>/dev/null >/dev/null
+  exit 1
+}
+
+_machine() {
+  local id=${1:-}
+  [ -n "$id" ] && { printf '%s' "$id"; return 0; }
+  [ -n "${IBX_MACHINE:-}" ] && { printf '%s' "$IBX_MACHINE"; return 0; }
+  [ -r "$CFG/machine" ] && { tr -d '\r\n' <"$CFG/machine"; return 0; }
+  _req GET "/machines?limit=5" || fail
+  id=$(_jq "field:machines.0.id") || { echo "ibx: 没有机器" >&2; return 1; }
+  printf '%s' "$id"
+}
+
+_op_wait() {  # _op_wait <opId> [最多秒]
+  local op=$1 max=${2:-300} i=0 st
+  [ -n "$op" ] || return 0
+  while [ "$i" -lt "$max" ]; do
+    _req GET "/operations/$op" || fail
+    st=$(_jq "field:state")
+    case "$st" in
+      succeeded) return 0 ;;
+      failed)    echo "ibx: 操作失败: $(_jq 'field:error.message')" >&2; return 1 ;;
+    esac
+    sleep 3; i=$((i + 3))
+  done
+  echo "ibx: 操作 $op 超时（${max}s）" >&2; return 1
+}
+
+# ---------- 子命令 ----------
+
+c_api() {
+  local m=$1 p=$2 d=${3:-}
+  _req "$m" "$p" "$d" || fail
+  printf '%s\n' "$BODY" | node "$JQ" "field:" 2>/dev/null || printf '%s\n' "$BODY"
+}
+
+c_ls() {
+  _req GET "/machines?limit=50" || fail
+  _jq machines
+}
+
+c_get() {
+  local id; id=$(_machine "${1:-}") || exit 1
+  _req GET "/machines/$id" || fail
+  _jq "field:"
+}
+
+c_life() {
+  local act=$1 id body op
+  id=$(_machine "${2:-}") || exit 1
+  body=$(_idem)
+  _req POST "/machines/$id/$act" '{}' "$body" || fail
+  op=$(_jq "field:id" 2>/dev/null || true)
+  echo "ibx: $act 已提交${op:+ operation=$op}"
+  if [ -n "$op" ] && [ "$act" != "wake" ]; then
+    _op_wait "$op" 420 || exit 1
+    _req GET "/machines/$id" || fail
+    echo "state=$(_jq 'field:state') ready=$(_jq 'field:runtime.ready') run=$(_jq 'field:runStartedAt')"
+  fi
+}
+
+c_wait() { _op_wait "$1" "${2:-600}" && echo "succeeded"; }
+
+c_rm() {  # 删除机器（不可逆），自动带 X-Confirm-Delete
+  local id key op tmp
+  id=$(_machine "${1:-}") || exit 1
+  key=$(_key) || exit 1
+  echo "ibx: 即将删除机器 $id（含持久盘与系统文件，不可逆）" >&2
+  tmp=$(mktemp)
+  IBX_CODE=$(curl -sS --max-time "$TIMEOUT" -X DELETE \
+    -H "X-API-Key: $key" -H "Idempotency-Key: $(_idem)" \
+    -H "X-Confirm-Delete: $id" -o "$tmp" -w '%{http_code}' "$API/machines/$id")
+  BODY=$(cat "$tmp"); rm -f "$tmp"
+  [ "${IBX_CODE:0:1}" = "2" ] || fail
+  op=$(printf '%s' "$BODY" | node "$JQ" field:id 2>/dev/null || true)
+  [ -n "$op" ] && { _op_wait "$op" 300 || exit 1; }
+  echo "deleted $id"
+}
+
+c_exec() {
+  local id="" cmd
+  if [[ "${1:-}" == m_* ]]; then id=$1; shift; fi
+  [ "${1:-}" = "--" ] && shift
+  [ "$#" -gt 0 ] || { echo "ibx: 缺命令" >&2; exit 2; }
+  id=$(_machine "$id") || exit 1
+  # 用 node 构造 JSON，避免转义问题
+  local data
+  data=$(printf '%s' "$*" | node -e '
+let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.stringify({cmd:s})));')
+  _req POST "/machines/$id/exec" "$data" || fail
+  _jq exec
+}
+
+_enc_path() {  # 只编码会破坏查询串的字符；斜杠保留
+  local p=$1
+  p=${p//%/\%25}; p=${p// /%20}; p=${p//&/%26}
+  p=${p//#/%23}; p=${p//\?/%3F}; p=${p//+/%2B}
+  printf '%s' "$p"
+}
+
+c_put() {
+  local path=$1 src=${2:-} id key tmp enc
+  id=$(_machine "") || exit 1
+  key=$(_key) || exit 1
+  enc=$(_enc_path "$path")
+  tmp=$(mktemp)
+  IBX_CODE=$(curl -sS --max-time 300 -X PUT -H "X-API-Key: $key" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@${src:--}" -o "$tmp" -w '%{http_code}' \
+    "$API/machines/$id/files?path=$enc")
+  BODY=$(cat "$tmp"); rm -f "$tmp"
+  [ "${IBX_CODE:0:1}" = "2" ] && echo "uploaded $path ($IBX_CODE)" || fail
+}
+
+c_getfile() {
+  local path=$1 dst=${2:-} id key enc
+  id=$(_machine "") || exit 1
+  key=$(_key) || exit 1
+  enc=$(_enc_path "$path")
+  if [ -n "$dst" ]; then
+    curl -sS --max-time 300 -H "X-API-Key: $key" -o "$dst" \
+      -w 'http=%{http_code} bytes=%{size_download}\n' "$API/machines/$id/files/content?path=$enc"
+  else
+    curl -sS --max-time 300 -H "X-API-Key: $key" "$API/machines/$id/files/content?path=$enc"
+  fi
+}
+
+c_lsfile() {
+  local id key tmp enc
+  id=$(_machine "") || exit 1
+  key=$(_key) || exit 1
+  enc=$(_enc_path "${1:-/data}")
+  tmp=$(mktemp)
+  IBX_CODE=$(curl -sS --max-time "$TIMEOUT" -H "X-API-Key: $key" \
+    -o "$tmp" -w '%{http_code}' "$API/machines/$id/files?path=$enc")
+  BODY=$(cat "$tmp"); rm -f "$tmp"
+  [ "${IBX_CODE:0:1}" = "2" ] || fail
+  printf '%s' "$BODY" | node "$JQ" files
+}
+
+c_ports() {
+  local id; id=$(_machine "${1:-}") || exit 1
+  _req GET "/machines/$id/ports" || fail
+  _jq ports
+}
+
+c_publish() {
+  local id=$(_machine "") port=$1 name=${2:-} access=${3:-public} data
+  [ -n "$id" ] || exit 1
+  # bun 下 node -e 的 argv 不可用，参数经环境变量传给 mkjson.js
+  data=$(P="$port" N="$name" A="$access" node -e 'process.stdout.write(JSON.stringify([process.env.P,process.env.N,process.env.A]))' \
+    | node "$SELF_DIR/mkjson.js" port)
+  _req POST "/machines/$id/ports" "$data" || fail
+  _jq "field:"
+}
+
+c_unpublish() {
+  local id=$(_machine "")
+  _req DELETE "/machines/$id/ports/$1" || fail
+  echo "unpublished $1"
+}
+
+c_snap() {
+  local id data
+  case "${1:-list}" in
+    list) _req GET "/snapshots?limit=50" || fail; _jq snapshots ;;
+    create)
+      [ -n "${2:-}" ] || { echo "ibx: 缺快照名" >&2; exit 2; }
+      id=$(_machine "") || exit 1
+      data=$(printf '["%s","%s"]' "$2" "${3:-}" | node "$SELF_DIR/mkjson.js" snapshot)
+      _req POST "/machines/$id/snapshots" "$data" "$(_idem)" || fail
+      _jq "field:" ;;
+    rm) _req DELETE "/snapshots/$2" "" "$(_idem)" || fail; echo "deleted $2" ;;
+    *) echo "ibx: snap list|create <名>|rm <id>" >&2; exit 2 ;;
+  esac
+}
+
+c_restore() {
+  local id data
+  id=$(_machine "") || exit 1
+  data=$(printf '["%s"]' "$1" | node "$SELF_DIR/mkjson.js" restore)
+  _req POST "/machines/$id/restore" "$data" "$(_idem)" || fail
+  _jq "field:"
+}
+
+c_info() {
+  local what=$1 id ep
+  id=$(_machine "${2:-}") || exit 1
+  case "$what" in
+    procs) ep=processes ;;
+    *)     ep=$what ;;
+  esac
+  _req GET "/machines/$id/$ep" || fail
+  case "$what" in
+    logs)    printf '%s' "$BODY" | node "$JQ" logs ;;
+    metrics) printf '%s' "$BODY" | node "$JQ" metrics ;;
+    disk)    printf '%s' "$BODY" | node "$JQ" disk ;;
+    *)       _jq "field:" ;;
+  esac
+}
+
+# ---------- 保活 ----------
+
+_ka_pid() { printf '%s/keepalive.pid' "$CFG"; }
+
+c_keepalive() {
+  local act=${1:-status} id pid
+  case "$act" in
+    start)
+      mkdir -p "$CFG"
+      pid=$(cat "$(_ka_pid)" 2>/dev/null)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "ibx: 保活已在运行 pid=$pid"; return 0
+      fi
+      id=$(_machine "") || exit 1
+      setsid bash "$SELF_DIR/ibx" keepalive _loop "$id" >>"$CFG/keepalive.log" 2>&1 &
+      sleep 1
+      echo "ibx: 保活已启动 pid=$(cat "$(_ka_pid)" 2>/dev/null)" ;;
+    stop)
+      pid=$(cat "$(_ka_pid)" 2>/dev/null)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" && echo "ibx: 已停止 pid=$pid"
+      else echo "ibx: 未在运行"; fi
+      rm -f "$(_ka_pid)" ;;
+    status)
+      pid=$(cat "$(_ka_pid)" 2>/dev/null)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "running pid=$pid"
+      else echo "stopped"; fi
+      echo "--- 最近日志 ---"; tail -6 "$CFG/keepalive.log" 2>/dev/null ;;
+    _loop)
+      # $2 是机器 ID（由 start 子命令传入）
+      id=${2:-}
+      [ -n "$id" ] || { echo "keepalive _loop: 缺机器 ID" >&2; exit 2; }
+      mkdir -p "$CFG"; echo $$ >"$(_ka_pid)"
+      local lease="ibx-keepalive" ttl=900 st op
+      trap 'rm -f "$(_ka_pid)"; exit 0' INT TERM
+      while :; do
+        _req PUT "/machines/$id/activity-leases/$lease" "{\"ttlSeconds\":$ttl}"
+        echo "$(date -u +%FT%TZ) lease http=$IBX_CODE expires=$(printf '%s' "$BODY" | node "$JQ" field:expiresAt 2>/dev/null)"
+        _req GET "/machines/$id"
+        st=$(printf '%s' "$BODY" | node "$JQ" field:state 2>/dev/null)
+        if [ -n "$st" ] && [ "$st" != "running" ]; then
+          _req POST "/machines/$id/start" '{}' "$(_idem)"
+          op=$(printf '%s' "$BODY" | node "$JQ" field:id 2>/dev/null)
+          echo "$(date -u +%FT%TZ) state=$st -> start http=$IBX_CODE op=$op"
+          [ "$IBX_CODE" != "202" ] && echo "$(date -u +%FT%TZ) start body=$BODY"
+          sleep 30
+        fi
+        sleep 780
+      done ;;
+    *) echo "ibx: keepalive start|stop|status" >&2; exit 2 ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+ibx — InstaBox 控制台
+
+机器
+  ibx ls                          列出机器
+  ibx get [id]                    机器详情
+  ibx start|stop|suspend|resume|wake [id]
+  ibx rm [id]                     删除机器（不可逆）
+  ibx wait <operationId> [秒]     等待异步操作
+
+执行 / 文件
+  ibx exec [id] [--] <命令>       沙箱内 bash -lc
+  ibx lsfile [路径]               列目录
+  ibx put <远端路径> [本地文件|-]  上传（默认读 stdin）
+  ibx getfile <远端路径> [本地文件] 下载（默认 stdout）
+
+网络
+  ibx ports [id]
+  ibx publish <端口> [名称] [private]
+  ibx unpublish <端口>
+
+快照
+  ibx snap list
+  ibx snap create <名称> [描述]
+  ibx snap rm <快照ID>
+  ibx restore <快照ID>
+
+观测
+  ibx logs|metrics|disk|history|procs [id]
+
+保活
+  ibx keepalive start|stop|status
+
+原始
+  ibx api <METHOD> <PATH> [JSON BODY]
+
+配置：IBX_API_KEY 或 ~/.instabox/key；IBX_MACHINE 或 ~/.instabox/machine
+EOF
+}
+
+main() {
+  local c=${1:-help}; shift || true
+  case "$c" in
+    ls) c_ls ;;
+    get) c_get "$@" ;;
+    rm) c_rm "$@" ;;
+    start|stop|suspend|resume|wake) c_life "$c" "${1:-}" ;;
+    wait) c_wait "$@" ;;
+    exec) c_exec "$@" ;;
+    put) c_put "$@" ;;
+    getfile) c_getfile "$@" ;;
+    lsfile) c_lsfile "$@" ;;
+    ports) c_ports "$@" ;;
+    publish) c_publish "$@" ;;
+    unpublish) c_unpublish "$@" ;;
+    snap) c_snap "$@" ;;
+    restore) c_restore "$@" ;;
+    logs|metrics|disk|history|procs) c_info "$c" "${1:-}" ;;
+    keepalive) c_keepalive "$@" ;;
+    api) c_api "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "ibx: 未知命令 $c" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
