@@ -1,0 +1,3 @@
+*.log
+keepalive.pid
+.instabox/
